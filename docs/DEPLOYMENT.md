@@ -45,11 +45,31 @@ Vercel cannot run your docker-compose Postgres. Any of these work; pick one:
 | Provider | Notes |
 | --- | --- |
 | **Vercel Postgres** | Create it from the project's Storage tab after import (Step 4). Integration auto-fills `POSTGRES_URL` — you then set `DATABASE_URL` to it. |
-| **Neon** | Free tier. Create a project → copy the pooled connection string (host ending in `-pooler`). |
-| **Supabase** | Free tier. Project → Settings → Database → connection string. Use the direct (non-pooler / port 5432) URI if available. |
+| **Neon** | Free tier. Create a project → copy the **pooled** connection string (host ending in `-pooler`). |
+| **Supabase** | Free tier. Project → Settings → Database → connection string. Use the **transaction-mode pooler (port 6543)** for the app and the **session-mode pooler (port 5432)** for migrations — see the pooler section below. |
 | **Railway / Render** | Any standard Postgres 14+ works. |
 
 Write the connection string down — it becomes the `DATABASE_URL` env var.
+
+### Supabase / Neon poolers: which URL goes where
+
+Connection poolers exist because serverless (Vercel) spawns many short-lived
+processes, each wanting its own DB connection. Two rules of thumb:
+
+- **App runtime → transaction-mode pooler.** For Supabase that is port **6543**
+  (`aws-0-<region>.pooler.supabase.com:6543`); for Neon it's the `-pooler`
+  host. Append `?pgbouncer=true&connection_limit=5` to the URL so Prisma uses
+  the pooler correctly with a bounded pool. This URL is your `DATABASE_URL`.
+- **Migrations → session/direct connection.** Supabase port **5432** (session
+  pooler) or Neon's direct host. Migrations over a transaction-mode pooler
+  fail, so keep a second URL handy and prefix the migrate command with it
+  (see step 3).
+
+> Why not point the app at the session pooler? Supabase caps it at **15**
+> concurrent clients and Prisma's default pool (`cpu×2+1`, often >15) plus
+> parallel queries like `/api/search`'s 8-way `Promise.all` blow straight past
+> it, producing `EMAXCONNSESSION` 500s. The transaction pooler's limit is far
+> higher and `connection_limit=5` keeps Vercel's usage bounded.
 
 ---
 
@@ -58,6 +78,7 @@ Write the connection string down — it becomes the `DATABASE_URL` env var.
 From a machine with network access to the hosted DB (your laptop is fine):
 
 ```bash
+# Use the SESSION / direct URL (not the transaction pooler) for both commands.
 # PowerShell:  $env:DATABASE_URL = "postgresql://..."
 DATABASE_URL="postgresql://<user>:<pass>@<host>:5432/<db>" npx prisma migrate deploy
 DATABASE_URL="postgresql://<user>:<pass>@<host>:5432/<db>" npm run db:seed
@@ -83,7 +104,7 @@ Seeded accounts (change or delete these before real use):
 
 | Variable | Value |
 | --- | --- |
-| `DATABASE_URL` | Your hosted Postgres connection string from step 2 |
+| `DATABASE_URL` | Your hosted Postgres **transaction-pooler** connection string from step 2 (with `?pgbouncer=true&connection_limit=5` appended for Supabase) |
 | `AUTH_SECRET` | `openssl rand -base64 32` (any long random string) |
 | `NEXT_PUBLIC_APP_URL` | `https://<your-project>.vercel.app` |
 | `OPENAI_API_KEY` | *Optional* — chat uses the built-in grounded engine without it |
@@ -124,8 +145,17 @@ A scheduled option (Vercel Cron) can be added later: hit
   the Vercel project (builds run with project env vars).
 - **`P1001: can't reach database` at runtime** — confirm the DB allows
   connections from Vercel (Neon/Supabase allow by default; Vercel Postgres is
-  auto-allowed) and the URL has no typo.
-- **Connection pool exhaustion** — if you use a pooled Neon URL and see pool
-  errors, switch `DATABASE_URL` to Neon's **direct** connection string instead.
+  auto-allowed) and the URL has no typo. On Supabase, also prefer the pooler
+  host: direct hosts can be IPv6-only, which Vercel (IPv4-only) cannot reach.
+- **`prepared statement "s1" already exists`** — this appears when running
+  `prisma db execute`/migrations through a transaction-mode pooler. Use the
+  session/direct URL for migrations; the app itself (`pgbouncer=true`) is
+  unaffected.
+- **`EMAXCONNSESSION` / pool exhaustion at runtime** — you're pointing the app
+  at a session-mode pooler (Supabase caps at 15 clients). Switch `DATABASE_URL`
+  to the **transaction-mode pooler (port 6543)** with
+  `?pgbouncer=true&connection_limit=5`. If the session pool is already full,
+  terminate stuck sessions from the transaction pooler:
+  `SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = current_database() AND pid <> pg_backend_pid() AND usename LIKE 'postgres.%' AND state = 'idle';`
 - **Redirect loop on login** — make sure `NEXT_PUBLIC_APP_URL` is the deployed
   `https://` origin, not `http://localhost:3000`.
