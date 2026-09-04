@@ -1,0 +1,35 @@
+# TechPulse AI local infrastructure.
+# PostgreSQL is the primary database; Redis is used as an optional cache layer
+# (the app degrades gracefully when Redis is not running).
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: techpulse-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: techpulse
+      POSTGRES_PASSWORD: techpulse
+      POSTGRES_DB: techpulse
+    ports:
+      # Host port 54329 avoids colliding with a locally installed PostgreSQL.
+      - "54329:5432"
+    volumes:
+      - techpulse_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U techpulse -d techpulse"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    container_name: techpulse-redis
+    restart: unless-stopped
+    ports:
+      - "16379:6379"
+    volumes:
+      - techpulse_redisdata:/data
+
+volumes:
+  techpulse_pgdata:
+  techpulse_redisdata:

@@ -1,0 +1,508 @@
+// TechPulse AI — PostgreSQL data model.
+//
+// The platform is modeled as a knowledge base of interlinked entities
+// (news, releases, technologies, companies, AI models/tools, repositories,
+// security advisories, sources, papers) rather than a flat list of articles,
+// so the UI and the AI assistant can answer relationship-aware questions.
+//
+// Conventions:
+//  - Importance / severity / kind / role are stored as plain strings over
+//    the fixed constant sets in src/lib/constants.ts.
+//  - Structured but heterogeneous data (capabilities, pricing, changelog
+//    sections, specs for comparison) lives in Json columns.
+//  - All entities that can be followed or saved use the generic
+//    {entityType, entityId} pattern in Follow / SavedItem.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Taxonomies
+// ────────────────────────────────────────────────────────────────────────────
+
+// Categories come in three flavors (see constants.ts):
+//  type = NEWS   → news feed categories ("Artificial Intelligence", "Security"…)
+//  type = DOMAIN → coarse technology domains ("Frontend", "Backend", "Cloud"…)
+//  type = TOOL   → AI tool directory categories ("AI Coding", "AI Agents"…)
+model Category {
+  id          String   @id @default(cuid())
+  key         String
+  type        String   @default("NEWS") // NEWS | DOMAIN | TOOL
+  name        String
+  emoji       String   @default("")
+  color       String   @default("#22d3ee")
+  description String?
+  sort        Int      @default(0)
+  createdAt   DateTime @default(now())
+
+  news         News[]
+  technologies Technology[]
+  aiTools      AITool[]
+
+  @@unique([key, type])
+}
+
+// Human / machine readable origin of items. reliabilityScore 1..10.
+model Source {
+  id             String    @id @default(cuid())
+  slug           String    @unique
+  name           String
+  type           String // OFFICIAL_DOCS | OFFICIAL_BLOG | GITHUB | CHANGELOG | RESEARCH | PUBLICATION | COMMUNITY | ADVISORY
+  url            String // canonical URL of the source itself
+  homepage       String?
+  description    String?
+  reliability    Int       @default(5)
+  active         Boolean   @default(true)
+  feedUrl        String?
+  lastCheckedAt  DateTime?
+  createdAt      DateTime  @default(now())
+
+  news          News[]
+  securityAdvisories SecurityAdvisory[]
+  sourceItems   SourceItem[]
+  ingestionJobs IngestionJob[]
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Core knowledge-base entities
+// ────────────────────────────────────────────────────────────────────────────
+
+model Technology {
+  id          String   @id @default(cuid())
+  slug        String   @unique
+  name        String   @unique
+  kind        String // LANGUAGE | FRAMEWORK | LIBRARY | DATABASE | TOOL | CLOUD | PLATFORM | SERVICE | OS | HARDWARE | MODEL_FAMILY | PROTOCOL
+  description String
+  accent      String   @default("#22d3ee") // brand tint used for dots/badges
+  website     String?
+  docsUrl     String?
+  githubUrl   String?
+  license     String?
+  stars       Int?
+  // Key/value facts used by the Compare module (e.g. { language: "Rust",
+  // paradigm: "reactive", license: "MIT" }) — free-form per kind.
+  details     Json?
+  isFeatured  Boolean  @default(false)
+  createdAt   DateTime @default(now())
+
+  categoryId String?
+  category   Category?       @relation(fields: [categoryId], references: [id])
+  companyId  String?
+  company    Company?        @relation(fields: [companyId], references: [id])
+
+  releases       Release[]
+  newsLinks      NewsTechnology[]
+  advisories     SecurityAdvisory[]
+  repositories   Repository[]
+
+  @@index([categoryId])
+  @@index([kind])
+}
+
+model Company {
+  id          String   @id @default(cuid())
+  slug        String   @unique
+  name        String   @unique
+  description String
+  accent      String   @default("#a78bfa")
+  website     String?
+  blogUrl     String?
+  githubOrg   String?
+  headquarters String?
+  founded     Int?
+  // Curated facts shown on company pages + used by Compare:
+  // { stock: "NVDA", funding: "…", ceo: "…" }
+  details     Json?
+  isFeatured  Boolean  @default(false)
+  createdAt   DateTime @default(now())
+
+  technologies Technology[]
+  releases     Release[]
+  aiModels     AIModel[]
+  aiTools      AITool[]
+  newsLinks    NewsCompany[]
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// News
+// ────────────────────────────────────────────────────────────────────────────
+
+// One News row = one *story*. Stories about the same underlying event share a
+// clusterKey (deduplication, §27): isPrimary marks the canonical/original item
+// (usually the official source) which the UI prioritizes.
+model News {
+  id          String   @id @default(cuid())
+  slug        String   @unique
+  kind        String // NEWS | RELEASE_ANNOUNCEMENT | SECURITY_ADVISORY | RESEARCH_PAPER | MODEL_RELEASE | TOOL_LAUNCH | GITHUB_RELEASE | COMPANY_NEWS
+  title       String
+  summary     String // TL;DR shown in feeds
+  analysis    Json     @default("{}") // { whatChanged?, whyItMatters?, whoAffected?, whatToDo? }
+  importance  String // CRITICAL | HIGH | MEDIUM | LOW
+  tags        Json     @default("[]")
+  publishedAt DateTime
+  fetchedAt   DateTime @default(now())
+  url         String? // original source URL
+  engagement  Int      @default(0) // approximated reach, used for "Top stories"
+  clusterKey  String?
+  isPrimary   Boolean  @default(true)
+  createdAt   DateTime @default(now())
+
+  categoryId String
+  category   Category @relation(fields: [categoryId], references: [id])
+  sourceId   String
+  source     Source   @relation(fields: [sourceId], references: [id])
+
+  // When the story announces a tracked Release, keep the back-reference so
+  // the release page can link to official coverage and vice-versa.
+  releaseId String?
+  release   Release? @relation(fields: [releaseId], references: [id])
+
+  technologies NewsTechnology[]
+  companies    NewsCompany[]
+
+  @@index([publishedAt(sort: Desc)])
+  @@index([categoryId, publishedAt(sort: Desc)])
+  @@index([importance, publishedAt(sort: Desc)])
+  @@index([clusterKey])
+  @@index([sourceId])
+}
+
+model NewsTechnology {
+  newsId       String
+  technologyId String
+  isPrimary    Boolean @default(false)
+
+  news       News        @relation(fields: [newsId], references: [id], onDelete: Cascade)
+  technology Technology @relation(fields: [technologyId], references: [id], onDelete: Cascade)
+
+  @@id([newsId, technologyId])
+}
+
+model NewsCompany {
+  newsId    String
+  companyId String
+  isPrimary Boolean @default(false)
+
+  news    News    @relation(fields: [newsId], references: [id], onDelete: Cascade)
+  company Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  @@id([newsId, companyId])
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Releases
+// ────────────────────────────────────────────────────────────────────────────
+
+model Release {
+  id              String   @id @default(cuid())
+  version         String
+  previousVersion String?
+  kind            String // MAJOR | MINOR | PATCH | SECURITY | BETA | RC | NIGHTLY
+  summary         String?
+  // changelog: { highlights: [], breaking: [], fixes: [], security: [],
+  //             performance: [], migration: [] }
+  changelog       Json     @default("{}")
+  importance      String
+  announcedOn     DateTime
+  notesUrl        String?
+  isPrerelease    Boolean  @default(false)
+  createdAt       DateTime @default(now())
+
+  technologyId String
+  technology   Technology @relation(fields: [technologyId], references: [id], onDelete: Cascade)
+  companyId    String?
+  company      Company?   @relation(fields: [companyId], references: [id])
+
+  news News[]
+
+  @@index([technologyId, announcedOn(sort: Desc)])
+  @@index([announcedOn(sort: Desc)])
+  @@index([importance, announcedOn(sort: Desc)])
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// AI models & tools
+// ────────────────────────────────────────────────────────────────────────────
+
+model AIModel {
+  id            String   @id @default(cuid())
+  slug          String   @unique
+  name          String // e.g. "Claude Opus 4.5"
+  family        String? // e.g. "claude-opus" — groups versions
+  version       String?
+  status        String   @default("STABLE") // STABLE | BETA | ALPHA | ARCHIVED
+  description   String
+  releasedOn    DateTime?
+  contextWindow Int?
+  maxOutput     Int?
+  // capabilities: { reasoning, toolCalling, structuredOutput, vision,
+  //                audio, imageGeneration, code, webSearch } booleans
+  capabilities Json @default("{}")
+  modalities   Json @default("[]") // e.g. ["text", "image", "audio"]
+  // pricing: { inputPerM, outputPerM, cachedInputPerM?, unit: "USD" }
+  pricing      Json?
+  openSource   Boolean @default(false)
+  license      String?
+  apiAvailable Boolean @default(true)
+  // benchmarks: { key: { score, link? } } free-form
+  benchmarks   Json @default("{}")
+  docsUrl      String?
+  cardUrl      String?
+  tags         Json @default("[]")
+  // extra facts used by Compare: { knowledgeCutoff?, releaseFormat? }
+  compare      Json @default("{}")
+  isFeatured   Boolean @default(false)
+  createdAt    DateTime @default(now())
+
+  providerId String
+  provider   Company @relation(fields: [providerId], references: [id])
+
+  @@index([releasedOn(sort: Desc)])
+  @@index([providerId])
+  @@index([family])
+}
+
+model AITool {
+  id            String   @id @default(cuid())
+  slug          String   @unique
+  name          String
+  description   String
+  pricingModel  String // FREE | FREEMIUM | PAID | ENTERPRISE | OPEN_SOURCE
+  priceLabel    String?
+  apiAvailable  Boolean  @default(false)
+  launchDate    DateTime?
+  latestUpdate  DateTime?
+  website       String?
+  docsUrl       String?
+  githubUrl     String?
+  stack         String?
+  features      Json     @default("[]")
+  useCases      Json     @default("[]")
+  competitors   Json     @default("[]")
+  tags          Json     @default("[]")
+  status        String   @default("LIVE") // LIVE | BETA | SHUTDOWN
+  isFeatured    Boolean  @default(false)
+  createdAt     DateTime @default(now())
+
+  companyId       String?
+  company         Company?  @relation(fields: [companyId], references: [id])
+  primaryCategoryId String?
+  primaryCategory   Category? @relation(fields: [primaryCategoryId], references: [id])
+
+  @@index([launchDate(sort: Desc)])
+  @@index([primaryCategoryId])
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// GitHub repositories
+// ────────────────────────────────────────────────────────────────────────────
+
+model Repository {
+  id           String   @id @default(cuid())
+  fullName     String   @unique
+  owner        String
+  name         String
+  description  String?
+  language     String?
+  homepage     String?
+  stars        Int      @default(0)
+  forks        Int      @default(0)
+  openIssues   Int      @default(0)
+  contributors Int      @default(0)
+  license      String?
+  // latestRelease: { tag, name?, date?, notesUrl? }
+  latestRelease Json?
+  topics       Json     @default("[]")
+  isFeatured   Boolean  @default(false)
+  lastSyncedAt DateTime?
+  createdAt    DateTime @default(now())
+
+  technologyId String?
+  technology   Technology? @relation(fields: [technologyId], references: [id])
+
+  @@index([stars(sort: Desc)])
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Security advisories
+// ────────────────────────────────────────────────────────────────────────────
+
+model SecurityAdvisory {
+  id             String   @id @default(cuid())
+  cveId          String? // "CVE-2026-12345" (sample data is illustrative)
+  title          String
+  description    String
+  severity       String // CRITICAL | HIGH | MEDIUM | LOW
+  cvssScore      Float?
+  affected       Json     @default("[]") // [{ product, versions }]
+  fixedVersions  Json     @default("[]") // [{ product, versions }]
+  recommendation String?
+  publishedAt    DateTime
+  advisoryUrl    String?
+  status         String   @default("ACTIVE") // ACTIVE | RESOLVED | UPDATED
+  tags           Json     @default("[]")
+  createdAt      DateTime @default(now())
+
+  technologyId String?
+  technology   Technology? @relation(fields: [technologyId], references: [id])
+  sourceId     String?
+  source       Source?     @relation(fields: [sourceId], references: [id])
+
+  @@index([publishedAt(sort: Desc)])
+  @@index([severity, publishedAt(sort: Desc)])
+  @@index([technologyId])
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Users & personalization
+// ────────────────────────────────────────────────────────────────────────────
+
+model User {
+  id            String   @id @default(cuid())
+  name          String?
+  email         String   @unique
+  passwordHash  String?
+  image         String?
+  role          String   @default("USER") // USER | ADMIN
+  headline      String?
+  bio           String?
+  // prefs: { dashboardCategories: [], notifPrefs: { releases, security,
+  //          aiModels, breakingChanges, majorAnnouncements, ecosystem },
+  //          digest: { enabled, time, scope: "DAILY"|"WEEKLY"|"OFF" } }
+  prefs         Json     @default("{}")
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  follows       Follow[]
+  savedItems    SavedItem[]
+  chats         Chat[]
+  notifications Notification[]
+}
+
+// Generic watchlist: entityType ∈ TECHNOLOGY | COMPANY | AIMODEL | AITOOL |
+// REPOSITORY | TOPIC (entityId = label for topics).
+model Follow {
+  id         String   @id @default(cuid())
+  userId     String
+  entityType String
+  entityId   String
+  label      String? // denormalized display label for fast listing
+  createdAt  DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, entityType, entityId])
+  @@index([userId, entityType])
+}
+
+// Generic bookmarks: same entityType vocabulary as Follow.
+model SavedItem {
+  id         String   @id @default(cuid())
+  userId     String
+  entityType String
+  entityId   String
+  note       String?
+  createdAt  DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, entityType, entityId])
+  @@index([userId, entityType])
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Chat
+// ────────────────────────────────────────────────────────────────────────────
+
+model Chat {
+  id        String   @id @default(cuid())
+  title     String   @default("New chat")
+  meta      Json     @default("{}") // { lastSubject, lastKind } for follow-ups
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  userId   String
+  user     User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  messages Message[]
+
+  @@index([userId, updatedAt(sort: Desc)])
+}
+
+model Message {
+  id        String   @id @default(cuid())
+  role      String // USER | ASSISTANT
+  content   String
+  sources   Json? // [{ title, url, kind, label }]
+  createdAt DateTime @default(now())
+
+  chatId String
+  chat   Chat @relation(fields: [chatId], references: [id], onDelete: Cascade)
+
+  @@index([chatId, createdAt])
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Notifications (materialized on-demand + by the digest worker)
+// ────────────────────────────────────────────────────────────────────────────
+
+model Notification {
+  id          String    @id @default(cuid())
+  kind        String // RELEASE | SECURITY | MODEL | TOOL | BREAKING | COMPANY | SYSTEM
+  title       String
+  body        String?
+  entityType  String?
+  entityId    String?
+  importance  String?
+  link        String?
+  fingerprint String // dedupe key, unique per user
+  readAt      DateTime?
+  createdAt   DateTime @default(now())
+
+  userId String
+  user   User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, fingerprint])
+  @@index([userId, readAt, createdAt(sort: Desc)])
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Ingestion plumbing
+// ────────────────────────────────────────────────────────────────────────────
+
+// Content-hash ledger used to deduplicate fetched items across runs and
+// sources (an item with the same urlHash or itemHash is never inserted twice).
+model SourceItem {
+  id        String    @id @default(cuid())
+  sourceId  String
+  urlHash   String    @unique
+  url       String?
+  title     String?
+  itemHash  String?
+  status    String    @default("NEW") // NEW | DUP | SKIPPED | ERROR
+  createdAt DateTime  @default(now())
+
+  source Source @relation(fields: [sourceId], references: [id], onDelete: Cascade)
+}
+
+model IngestionJob {
+  id           String    @id @default(cuid())
+  kind         String // RSS | GITHUB | MANUAL | SEED | FULL
+  status       String    @default("RUNNING") // RUNNING | DONE | FAILED
+  startedAt    DateTime  @default(now())
+  finishedAt   DateTime?
+  itemsFound   Int       @default(0)
+  itemsAdded   Int       @default(0)
+  itemsSkipped Int       @default(0)
+  error        String?
+  log          Json      @default("[]")
+  createdAt    DateTime  @default(now())
+
+  sourceId String?
+  source   Source? @relation(fields: [sourceId], references: [id])
+}
